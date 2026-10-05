@@ -25,6 +25,8 @@ import httpx
 
 from . import __version__
 from . import specs
+from .control import serve as serve_control
+from .ledger import Ledger, hourly_rate
 from .runtime import JobRuntime, RunResult, select_runtime
 
 log = logging.getLogger("dcm.worker")
@@ -46,6 +48,7 @@ class AgentConfig:
     state_file: Path | None
     die_after_seconds: float | None
     exit_after_jobs: int | None
+    control_port: int = 8792  # 0 disables the local control API
 
 
 class Agent:
@@ -59,6 +62,18 @@ class Agent:
         if config.gpu is not None:
             self.machine.gpu = config.gpu
             self.machine.gpu_name = config.gpu_name or ("Simulated GPU" if config.gpu else None)
+
+        full = specs.probe(donate_fraction=1.0)
+        self.max_cores = max(full.cpu_cores, self.machine.cpu_cores)
+        self._gpu_name = self.machine.gpu_name or full.gpu_name
+        self._online = threading.Event()
+        self._online.set()
+        self._registered = False
+        self._specs_dirty = threading.Event()
+        self.max_memory_mb = max(full.memory_mb, self.machine.memory_mb)
+        self.ledger = Ledger(
+            Path(os.environ.get("DCM_LEDGER", Path.home() / ".dcm-agent" / "ledger.json"))
+        )
 
         self.runtime: JobRuntime = select_runtime(config.runtime)
         self.client = httpx.Client(base_url=config.coordinator.rstrip("/"), timeout=20.0)
@@ -117,7 +132,7 @@ class Agent:
             "platform": self.machine.platform,
             "agent_version": __version__,
             "runtime": self.runtime.name,
-            "worker_id": self._load_worker_id(),
+            "worker_id": self.worker_id or self._load_worker_id(),
         }
         deadline = time.monotonic() + 60
         while True:
@@ -140,6 +155,7 @@ class Agent:
         self.heartbeat_interval = float(body.get("heartbeat_interval_seconds", 5))
         self.poll_interval = float(body.get("poll_interval_seconds", 2))
         self._save_worker_id()
+        self._registered = True
         log.info(
             "registered as %s (%s) — %.1f cores, %d MB, gpu=%s, runtime=%s",
             self.config.name,
@@ -152,12 +168,18 @@ class Agent:
 
     def run_forever(self) -> None:
         self.register()
+        if self.config.control_port:
+            serve_control(self, "127.0.0.1", self.config.control_port)
+            log.info("control API on http://127.0.0.1:%d", self.config.control_port)
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
         threading.Thread(target=self._log_loop, daemon=True).start()
         if self.config.die_after_seconds:
             threading.Thread(target=self._chaos_timer, daemon=True).start()
 
         while not self._shutdown.is_set():
+            if not self._sync_presence():
+                self._shutdown.wait(self.poll_interval)
+                continue
             lease = self._request_lease()
             if lease is None:
                 self._shutdown.wait(self.poll_interval)
@@ -172,10 +194,75 @@ class Agent:
     def shutdown(self) -> None:
         self._shutdown.set()
         self._cancel_run.set()
-        if self.worker_id:
+        if self.worker_id and self._registered:
             self._flush_logs()
             self._post(f"/v1/workers/{self.worker_id}/deregister", {})
+            self._registered = False
         self.client.close()
+
+    # ------------------------------------------------------- dashboard control
+
+    def set_online(self, online: bool) -> None:
+        """Request only; the main loop acts on it, so a running job is never cut off."""
+        (self._online.set if online else self._online.clear)()
+
+    def apply_limits(
+        self, *, cpu_cores: float | None, memory_mb: int | None, gpu: bool | None
+    ) -> None:
+        if memory_mb is not None:
+            if not 256 <= memory_mb <= self.max_memory_mb:
+                raise ValueError(f"memory_mb must be between 256 and {self.max_memory_mb}")
+            self.machine.memory_mb = int(memory_mb)
+        if cpu_cores is not None:
+            if not 0.5 <= cpu_cores <= self.max_cores:
+                raise ValueError(f"cpu_cores must be between 0.5 and {self.max_cores}")
+            self.machine.cpu_cores = round(float(cpu_cores), 2)
+        if gpu is not None:
+            if gpu and not self._gpu_name:
+                raise ValueError("no GPU detected on this machine")
+            self.machine.gpu = gpu
+            self.machine.gpu_name = self._gpu_name if gpu else None
+        self._specs_dirty.set()
+
+    def _sync_presence(self) -> bool:
+        """Apply dashboard changes between jobs. True when we may lease work."""
+        if not self._online.is_set():
+            if self._registered:
+                self._flush_logs()
+                self._post(f"/v1/workers/{self.worker_id}/deregister", {})
+                self._registered = False
+                log.info("offline: deregistered from the coordinator")
+            return False
+        if not self._registered or self._specs_dirty.is_set():
+            self._specs_dirty.clear()
+            self.register()
+        return True
+
+    def rate(self) -> dict[str, float]:
+        return hourly_rate(self.machine.cpu_cores, self.machine.memory_mb, self.machine.gpu)
+
+    def status(self) -> dict[str, Any]:
+        wanted, registered = self._online.is_set(), self._registered
+        state = ("online" if registered else "connecting") if wanted else (
+            "draining" if registered else "offline"
+        )
+        return {
+            "state": state,
+            "busy": self._active_attempt is not None,
+            "name": self.config.name,
+            "worker_id": self.worker_id,
+            "coordinator": self.config.coordinator,
+            "runtime": self.runtime.name,
+            "cpu_cores": self.machine.cpu_cores,
+            "max_cpu_cores": self.max_cores,
+            "gpu": self.machine.gpu,
+            "gpu_available": bool(self._gpu_name),
+            "gpu_name": self._gpu_name,
+            "memory_mb": self.machine.memory_mb,
+            "max_memory_mb": self.max_memory_mb,
+            "rate": self.rate(),
+            **self.ledger.stats(self.config.name),
+        }
 
     def request_stop(self, signum: int, _frame: object) -> None:
         log.info("signal %s received — stopping the current job and releasing its lease", signum)
@@ -205,6 +292,9 @@ class Agent:
 
     def _heartbeat_loop(self) -> None:
         while not self._shutdown.is_set():
+            if not self._registered:  # offline: stay silent
+                self._shutdown.wait(1)
+                continue
             active = [self._active_attempt] if self._active_attempt else []
             body = self._post(
                 f"/v1/workers/{self.worker_id}/heartbeat",
@@ -264,6 +354,7 @@ class Agent:
         if started is None:
             self._active_attempt = None
             return
+        self.ledger.start(attempt_id, job["name"], self.rate()["total"])
 
         deadline = time.monotonic() + job["timeout_seconds"]
         watchdog = threading.Thread(
@@ -280,6 +371,13 @@ class Agent:
             result = RunResult(exit_code=None, start_failed=True, reason=f"runtime error: {exc}")
 
         self._flush_logs()
+        outcome = (
+            "error" if result.start_failed
+            else "cancelled" if self._cancel_run.is_set() or self._orphaned.is_set()
+            else "succeeded" if result.exit_code == 0
+            else "failed"
+        )
+        self.ledger.finish(attempt_id, outcome)
         self._report(attempt_id, result)
         self._active_attempt = None
 
@@ -373,6 +471,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--exit-after-jobs", type=int, default=None, help="demo: stop after N jobs"
     )
+    parser.add_argument(
+        "--control-port",
+        type=int,
+        default=int(os.environ.get("DCM_CONTROL_PORT", 8792)),
+        help="local port for the agent dashboard (0 disables)",
+    )
     parser.add_argument("--log-level", default=os.environ.get("DCM_LOG_LEVEL", "info"))
     return parser
 
@@ -396,6 +500,7 @@ def run() -> None:
             state_file=Path(args.state_file) if args.state_file else None,
             die_after_seconds=args.die_after_seconds,
             exit_after_jobs=args.exit_after_jobs,
+            control_port=args.control_port,
         )
     )
     signal.signal(signal.SIGINT, agent.request_stop)
